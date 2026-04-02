@@ -1,0 +1,109 @@
+name: Build and Push Custom Cognee Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .github/workflows/build.yml
+  schedule:
+    # Check for upstream updates daily at 06:00 UTC
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  UPSTREAM_IMAGE: cognee/cognee:main
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.compare.outputs.changed }}
+      upstream_digest: ${{ steps.upstream.outputs.digest }}
+    steps:
+      - name: Get upstream image digest
+        id: upstream
+        run: |
+          digest=$(docker manifest inspect ${{ env.UPSTREAM_IMAGE }} 2>/dev/null | jq -r '.digest // empty')
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Upstream digest: $digest"
+
+      - name: Get current image labels
+        id: current
+        run: |
+          token=$(curl -sf "https://ghcr.io/token?scope=repository:${{ github.repository }}:pull" | jq -r '.token')
+          digest=$(curl -sf -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json" \
+            "https://ghcr.io/v2/${{ github.repository }}/manifests/latest" 2>/dev/null | jq -r '.digest // empty')
+
+          if [ -n "$digest" ]; then
+            base=$(curl -sf -H "Authorization: Bearer $token" \
+              "https://ghcr.io/v2/${{ github.repository }}/manifests/$digest" 2>/dev/null | \
+              jq -r '.config.digest // empty')
+            if [ -n "$base" ]; then
+              label=$(curl -sf -H "Authorization: Bearer $token" \
+                "https://ghcr.io/v2/${{ github.repository }}/blobs/$base" 2>/dev/null | \
+                jq -r '.config.Labels["org.opencontainers.image.base.digest"] // empty')
+              echo "base_digest=$label" >> "$GITHUB_OUTPUT"
+              echo "Current base digest label: $label"
+            fi
+          fi
+          echo "base_digest=${base_digest:-}" >> "$GITHUB_OUTPUT"
+
+      - name: Compare digests
+        id: compare
+        run: |
+          upstream="${{ steps.upstream.outputs.digest }}"
+          current="${{ steps.current.outputs.base_digest }}"
+          if [ "$upstream" != "$current" ] || [ -z "$current" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream changed or no current image -- will rebuild"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No upstream change -- skipping build"
+          fi
+
+  build:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.changed == 'true' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=main
+            type=sha,prefix=
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.base.digest=${{ needs.check-upstream.outputs.upstream_digest }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
