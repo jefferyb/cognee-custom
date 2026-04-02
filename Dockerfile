@@ -1,6 +1,8 @@
 FROM cognee/cognee:main
 
-RUN python -m pip install --no-cache-dir \
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+RUN uv pip install --python /app/.venv/bin/python --no-cache \
     google-auth \
     google-cloud-aiplatform \
     pyasn1-modules \
