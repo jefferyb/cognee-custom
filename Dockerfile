@@ -7,4 +7,5 @@ RUN uv pip install --python /app/.venv/bin/python --no-cache \
     google-cloud-aiplatform \
     pyasn1-modules \
     rsa \
-    cachetools
+    cachetools \
+    diskcache
